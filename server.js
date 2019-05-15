@@ -40,8 +40,12 @@ function openChannelToMerger(){
 
         const replyMsg = packer.pack(header.msg_type, payload, header.chainid, header.sender);
         const Msg = packer.protobuf_msg_serializer(PROTO_PATH, "grpc_signer.ReplyMsg", replyMsg);
-        users.get(sID).write(Msg);
-        });
+        if(users.get(sID) != null){
+            users.get(sID).write(Msg);
+        } else {
+            sendLeaveMsg(sID);
+        }
+    });
     
     channel.on("end", () => {
         console.log("The channel has closed by the server");
@@ -59,14 +63,20 @@ function doOpenChannel(call) {
       const sID = msg.sender.toString('ascii');
       console.log(msg);
       if(users.get(sID) != null){
-        // request deletion of signer information which has the sID
+        sendLeaveMsg(sID);
         users.get(sID).end();
       }
       users.set(sID, call);
   });
 
   call.on('end', () =>{
-      console.log('end');
+      const sID = [...users.entries()]
+      .filter(({ 1: v }) => v === call)
+      .map(([k]) => k);
+      if(sID != null){
+        sendLeaveMsg(sID[0]);
+        users.delete(sID[0]);
+      }
       call.end();
   });
   call.on("error",  () => {
@@ -92,6 +102,20 @@ function doSignerService(msg, sendRes) {
        sendRes(err, res);
     });
 }
+
+function sendLeaveMsg(sID){
+    let msg = {};
+    msg.sID = sID;
+    msg.time = packer.getTimestamp;
+    msg.msg = "disconnected with signer";
+    const dummyCID = new Buffer("DUMMYCID").toString('base64');
+    const req = packer.pack(packer.MSG_TYPE.MSG_LEAVE, msg, dummyCID, sID);
+    const reqMsg = packer.protobuf_msg_serializer(PROTO_PATH, "grpc_signer.RequestMsg", req);
+    msg_sender.signerService(reqMsg, ()=>{
+        console.log("Send Leave Msg : " + sID);
+    });
+}
+
 
 /**
  * @return {!Object} gRPC server
