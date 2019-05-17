@@ -35,15 +35,28 @@ function openChannelToMerger(){
         const header = packer.getHeader(reply.message);
         const sID = payload.sID;
         delete payload["sID"];
-        console.log("merger -> signer : " + sID);
         console.log(payload);
+
+        const sIDs = JSON.parse(JSON.stringify(sID));
+        console.log("merger -> signer : " + sIDs);
 
         const replyMsg = packer.pack(header.msg_type, payload, header.chainid, header.sender);
         const Msg = packer.protobuf_msg_serializer(PROTO_PATH, "grpc_signer.ReplyMsg", replyMsg);
-        if(users.get(sID) != null){
-            users.get(sID).write(Msg);
+        if(Array.isArray(sIDs)){
+            let i = 0;
+            for(i = 0; i < sIDs.length; i++){
+                if(users.get(sIDs[i]) != null){
+                    users.get(sIDs[i]).write(Msg);
+                } else {
+                    sendLeaveMsg(sIDs[i]);
+                }
+            }
         } else {
-            sendLeaveMsg(sID);
+            if(users.get(sIDs) != null) {
+                users.get(sIDs).write(Msg);
+            } else {
+                sendLeaveMsg(sIDs);
+            }
         }
     });
     
