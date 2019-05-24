@@ -11,6 +11,7 @@ const HEADER_LENGTH = 32;
 const MSG_TYPE = {
     MSG_JOIN: 0x54,
     MSG_LEAVE: 0x5B,
+    MSG_GET_MERGER_ID: 0x5C,
     MSG_REQ_SSIG: 0xB2,
 	MSG_SSIG: 0xB3,
 	MSG_TX: 0xB1,
