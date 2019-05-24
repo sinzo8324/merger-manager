@@ -78,10 +78,10 @@ function openChannelToMerger(targetID){
     
     channel.on("end", () => {
         console.log("The channel has closed by the server");
-        });
+    });
     channel.on("error",  () => {
         console.log("The server is DEAD");
-        });
+    });
 }
 
 /**
@@ -181,12 +181,12 @@ function sendLeaveMsg(sID, mID){
  * @return {!Object} gRPC server
  */
 function getServer() {
-  const server = new grpc.Server();
-  server.addService(protoSigner.GruutSignerService.service, {
-    openChannel: doOpenChannel,
-    signerService: doSignerService
-  });
-  return server;
+    const server = new grpc.Server();
+    server.addService(protoSigner.GruutSignerService.service, {
+        openChannel: doOpenChannel,
+        signerService: doSignerService
+    });
+    return server;
 }
 
 if (require.main === module) {
