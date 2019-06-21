@@ -15,115 +15,125 @@ const LOAD_ARGS = {
 const PROTO_PATH = __dirname + '/protos/'+ process.env.PROTO_FILE;
 const JSON_PATH = __dirname + '/' + process.env.MERGER_LIST_FILE;
 
-const rawdata = fs.readFileSync(JSON_PATH);
-const mergerList = JSON.parse(rawdata);
+const mergerList = readMergerList(JSON_PATH);
 
 const packageDefinition = protoLoader.loadSync(
     PROTO_PATH, LOAD_ARGS
 );
-//Streaming channel signer <-> m/m
-let users = new Map();
-//GRPC Signer Service Object m/m <-> merger
-let mergers = new Map();
 
-const mmID = new Buffer(process.env.MERGER_MANAGER_ID).toString('base64');
+let grpcConnections = new Map();
+let signerStreamingList = new Map();
+
 const protoSigner = grpc.loadPackageDefinition(packageDefinition).grpc_signer;
 
-for(let i = 0; i < mergerList.length; i++) {
-    const address = mergerList[i].address + ':' + mergerList[i].port;
-    const msg_sender = new protoSigner.GruutSignerService(address, grpc.credentials.createInsecure());
-    mergers.set(mergerList[i].id, msg_sender);
+function readMergerList(filePath){
+    let mergerList;
+    try{
+        const rawdata = fs.readFileSync(filePath);
+        mergerList = JSON.parse(rawdata);
+    }catch(e){
+        console.log("error");
+    }
+    return mergerList;
 }
 
-
-/**
- * Open Streaming Channel (m/m <-> merger)
- * targetID = Merger ID wants to connect
- */
-function openChannelToMerger(targetID){
-    const identify = packer.protobuf_id_serializer(PROTO_PATH, "grpc_signer.Identity", new Buffer.from(mmID));
-    const msg_sender = mergers.get(targetID);
-    const channel = msg_sender.openChannel();
-    channel.write(identify);
-    channel.on("data", reply => {
-        let payload = packer.unpack(reply.message);
-        const header = packer.getHeader(reply.message);
-        const sID = payload.sID;
-        const mID = payload.mID;
-        delete payload["sID"];
-
-        const sIDs = JSON.parse(JSON.stringify(sID));
-        const replyMsg = packer.pack(header.msg_type, payload, header.chainid, header.sender);
-        const Msg = packer.protobuf_msg_serializer(PROTO_PATH, "grpc_signer.ReplyMsg", replyMsg);
-        let connectionList;
-
-        if(Array.isArray(sIDs)){
-            for(let i = 0; i < sIDs.length; i++){
-                connectionList = users.get(sIDs[i]);
-                try{
-                    connectionList.get(mID).write(Msg);
-                } catch(e) {
-                    sendLeaveMsg(sIDs[i], mID);
-                }
-            }
-        } else {
-            connectionList = users.get(sIDs);
-            try{
-                connectionList.get(mID).write(Msg);
-            } catch(e) {
-                sendLeaveMsg(sIDs, mID);
-            }
+function getIdx(mergerID){
+    for(let i = 0; i < Object.keys(mergerList).length; i++){
+        if(mergerList[i].id === mergerID){
+            return i;
         }
-    });
-    
-    channel.on("end", () => {
-        console.log("The channel has closed by the server");
-    });
-    channel.on("error",  () => {
-        console.log("The server is DEAD");
-    });
+    }
+    return null;
 }
 
 /**
- * rpc OpenChannel (Signer <-> m/m)
+ * Send Leave Message to merger
+ */
+function sendLeaveMsg(connection, sID){
+    let msg = {};
+    msg.sID = sID;
+    msg.time = packer.getTimestamp();
+    msg.msg = "disconnected with signer";
+    const dummyCID = new Buffer("DUMMYCID").toString('base64');
+    const req = packer.pack(packer.MSG_TYPE.MSG_LEAVE, msg, dummyCID, sID);
+    const reqMsg = packer.protobuf_msg_serializer(PROTO_PATH, "grpc_signer.RequestMsg", req);
+    connection.signerService(reqMsg, ()=>{
+        console.log("Send Leave Msg : " + sID);
+    });
+}
+
+function setSignerStreamingChannel(sID, mID, call){
+    let channelList = signerStreamingList.get(sID);
+    if(channelList == null){
+        channelList = new Map();
+        signerStreamingList.set(sID, channelList);
+    }
+    channelList.set(mID, call);
+}
+
+/**
+ *  rpc Streaming channel
  */
 function doOpenChannel(call) {
     call.on('data', msg => {
         const sID = msg.sender.toString('ascii');
         const mID = msg.receiver.toString('ascii');
-        let connectionList = users.get(sID);
+        let connectionList = grpcConnections.get(sID);
+        let connection;
 
-        if(connectionList != null){
-            if(connectionList.get(mID) != null){
-                sendLeaveMsg(sID, mID);
-                connectionList.get(mID).end();
-            }
-            connectionList.set(mID, call);
-        }else {
+        setSignerStreamingChannel(sID, mID, call);
+
+        if(connectionList == null){
             connectionList = new Map();
-            connectionList.set(mID, call);
-            users.set(sID, connectionList);
+            grpcConnections.set(sID, connectionList);
         }
+
+        connection = connectionList.get(mID);
+        if(connection != null){
+            sendLeaveMsg(connection, sID);
+        }
+
+        const idx = getIdx(mID);
+        const address = mergerList[idx].address + ':' + mergerList[idx].port;
+        connection = new protoSigner.GruutSignerService(address, grpc.credentials.createInsecure());
+        connectionList.set(mID, connection);
+        const streamingChannel = connection.openChannel();
+        streamingChannel.write(msg);
+
+        streamingChannel.on("data", reply => {
+            call.write(reply);
+        });
+
+        streamingChannel.on("end", () => {
+            console.log("lost connection with merger");
+            streamingChannel.end();
+        });
+        streamingChannel.on("error", () => {
+            console.log("merger connection error");
+            call.end();
+        });
     });
 
     call.on('end', () =>{
-        let iterator = users.entries();
+        let iterator = signerStreamingList.entries();
         let entry = iterator.next();
         while(entry.value != null){
-            let connectionList = entry.value[1];
-            const mID = [...connectionList.entries()]
+            let channelList = entry.value[1];
+            const mID = [...channelList.entries()]
                         .filter(({ 1: v }) => v === call)
                         .map(([k]) => k);
-            if(mID != null){
-                sendLeaveMsg(entry.value[0], mID[0]);
-                connectionList.delete(mID[0]);
+            if(mID[0] !== undefined){
+                let connectionToClose = (grpcConnections.get(entry.value[0])).get(mID[0]);
+                sendLeaveMsg(connectionToClose, entry.value[0]);
+                channelList.delete(mID[0]);
             }
             entry = iterator.next();
         }
         call.end();
     });
     call.on("error",  () => {
-        console.log("The server is DEAD");
+        console.log("signer connection error");
+        call.end();
     });
 }
 
@@ -145,37 +155,28 @@ function doSignerService(msg, sendRes) {
         sendRes(null, response);
     } else {
         let payload = packer.unpack(msg.request.message);
-        const msg_sender = mergers.get(payload.mID);
+        const connectionList = grpcConnections.get(payload.sID);
+        if(connectionList == null){
+            console.log("Can not found Connection list of signer(" + payload.sID + ")");
+            return;
+        }
+        const mID = payload.mID;
+        const sender = connectionList.get(mID);
+        if(sender == null){
+            console.log("Can not found connection : signer(" + payload.sID + ") - merger(" + mID +")");
+            return;
+        }
+
         delete payload["mID"];
-        payload.mmID = mmID;
+
         const req = packer.pack(header.msg_type, payload, header.chainid, header.sender);
         const reqMsg = packer.protobuf_msg_serializer(PROTO_PATH, "grpc_signer.RequestMsg", req);
 
-        msg_sender.signerService(reqMsg, (err, res) => {
+        sender.signerService(reqMsg, (err, res) => {
             sendRes(err, res);
         });
     }
 }
-
-/**
- * Send Leave Message to merger
- */
-function sendLeaveMsg(sID, mID){
-    let msg = {};
-    msg.sID = sID;
-    msg.time = packer.getTimestamp();
-    msg.msg = "disconnected with signer";
-    const dummyCID = new Buffer("DUMMYCID").toString('base64');
-    const req = packer.pack(packer.MSG_TYPE.MSG_LEAVE, msg, dummyCID, sID);
-    const reqMsg = packer.protobuf_msg_serializer(PROTO_PATH, "grpc_signer.RequestMsg", req);
-    const msg_sender = mergers.get(mID);
-    if(msg_sender != null){
-        msg_sender.signerService(reqMsg, ()=>{
-            console.log("Send Leave Msg : " + sID);
-        });
-    }
-}
-
 
 /**
  * @return {!Object} gRPC server
@@ -190,9 +191,6 @@ function getServer() {
 }
 
 if (require.main === module) {
-    for(let i = 0; i < mergerList.length; i++){
-        openChannelToMerger(mergerList[i].id);
-    }
     const server = getServer();
     const addr = '0.0.0.0:' + process.env.PORT;
     server.bind(addr, grpc.ServerCredentials.createInsecure());
